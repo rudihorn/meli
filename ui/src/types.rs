@@ -113,6 +113,7 @@ pub enum UIMode {
     Insert,
     Execute,
     Fork,
+    Embed,
 }
 
 impl fmt::Display for UIMode {
@@ -125,6 +126,7 @@ impl fmt::Display for UIMode {
                 UIMode::Insert => "INSERT",
                 UIMode::Execute => "EX",
                 UIMode::Fork => "FORK",
+                UIMode::Embed => "EMBED",
             }
         )
     }

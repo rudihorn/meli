@@ -44,6 +44,8 @@ pub struct Composer {
     form: FormWidget,
 
     mode: ViewMode,
+
+    body_area: Area, // Cache body_area in case we need to replace it with a pseudoterminal
     sign_mail: ToggleFlag,
     dirty: bool,
     has_changes: bool,
@@ -67,6 +69,7 @@ impl Default for Composer {
             sign_mail: ToggleFlag::Unset,
             dirty: true,
             has_changes: false,
+            body_area: ((0, 0), (0, 0)),
             initialized: false,
             id: ComponentId::new_v4(),
         }
@@ -747,6 +750,13 @@ impl Component for Composer {
             UIEvent::Input(Key::Char('e')) => {
                 /* Edit draft in $EDITOR */
                 use std::process::{Command, Stdio};
+                context.input_kill();
+                crate::terminal::embed::create_pty(self.body_area).unwrap();
+
+                context
+                    .replies
+                    .push_back(UIEvent::ChangeMode(UIMode::Embed));
+                return true;
                 let settings = &context.settings;
                 let editor = if let Some(editor_cmd) = settings.composing.editor_cmd.as_ref() {
                     editor_cmd.to_string()
