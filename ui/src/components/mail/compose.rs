@@ -21,6 +21,7 @@
 
 use super::*;
 
+use crate::terminal::embed::EmbedPty;
 use melib::Draft;
 use mime_apps::query_mime_info;
 use std::str::FromStr;
@@ -46,6 +47,7 @@ pub struct Composer {
     mode: ViewMode,
 
     body_area: Area, // Cache body_area in case we need to replace it with a pseudoterminal
+    embed: Option<EmbedPty>,
     sign_mail: ToggleFlag,
     dirty: bool,
     has_changes: bool,
@@ -70,6 +72,7 @@ impl Default for Composer {
             dirty: true,
             has_changes: false,
             body_area: ((0, 0), (0, 0)),
+            embed: None,
             initialized: false,
             id: ComponentId::new_v4(),
         }
@@ -530,6 +533,25 @@ impl Component for Composer {
                 Color::Default,
             );
         }
+        self.body_area = body_area;
+        if let Some(ref mut embed_pty) = self.embed {
+            let lock = embed_pty.grid.lock().unwrap();
+            copy_area(
+                grid,
+                &lock,
+                area,
+                ((0, 0), pos_dec(embed_pty.terminal_size, (1, 1))),
+            );
+            for y in 0..embed_pty.terminal_size.1 {
+                for x in 0..embed_pty.terminal_size.0 {
+                    if lock[(x, y)].ch() != ' ' {
+                        debug!("coors {:?} char = {}", (x, y), lock[(x, y)].ch());
+                    }
+                }
+            }
+            context.dirty_areas.push_back(area);
+            debug!("copied grid");
+        }
 
         match self.mode {
             ViewMode::ThreadView | ViewMode::Edit => {}
@@ -747,12 +769,27 @@ impl Component for Composer {
                 }
                 return true;
             }
+            UIEvent::EmbedInput(Key::Char(c)) => {
+                debug!("got embed input {:?}", event);
+                let mut buf: [u8; 4] = [0; 4];
+                let s = c.encode_utf8(&mut buf);
+
+                use std::io::Write;
+                self.embed
+                    .as_mut()
+                    .unwrap()
+                    .stdin
+                    .write_all(s.as_bytes())
+                    .unwrap();
+                self.dirty = true;
+                return true;
+            }
             UIEvent::Input(Key::Char('e')) => {
                 /* Edit draft in $EDITOR */
                 use std::process::{Command, Stdio};
-                context.input_kill();
-                crate::terminal::embed::create_pty(self.body_area).unwrap();
-
+                self.embed = Some(crate::terminal::embed::create_pty(self.body_area).unwrap());
+                self.dirty = true;
+                debug!("returned");
                 context
                     .replies
                     .push_back(UIEvent::ChangeMode(UIMode::Embed));

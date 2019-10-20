@@ -1,8 +1,17 @@
 use crate::terminal::position::Area;
 use nix::fcntl::{open, OFlag};
 use nix::ioctl_write_ptr_bad;
+use nix::libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, Winsize};
 use nix::sys::stat::Mode;
+use nix::sys::{stat, wait};
+use nix::unistd::{dup2, fork, setsid, ForkResult};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+
+mod grid;
+
+use crate::terminal::cells::{Cell, CellBuffer};
+pub use grid::*;
 
 // ioctl command to set window size of pty:
 use libc::TIOCSWINSZ;
@@ -11,13 +20,20 @@ use std::process::{Command, Stdio};
 
 use std::io::Read;
 use std::io::Write;
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::sync::{Arc, Mutex};
 
 ioctl_write_ptr_bad!(set_window_size, TIOCSWINSZ, Winsize);
 
 static SWITCHALTERNATIVE_1049: &'static [u8] = &[b'1', b'0', b'4', b'9'];
 
-pub fn create_pty(area: Area) -> nix::Result<()> {
+#[derive(Debug)]
+pub struct EmbedPty {
+    pub grid: Arc<Mutex<CellBuffer>>,
+    pub stdin: std::fs::File,
+    pub terminal_size: (usize, usize),
+}
+
+pub fn create_pty(area: Area) -> nix::Result<EmbedPty> {
     // Open a new PTY master
     let master_fd = posix_openpt(OFlag::O_RDWR)?;
 
@@ -29,34 +45,55 @@ pub fn create_pty(area: Area) -> nix::Result<()> {
     let slave_name = unsafe { ptsname(&master_fd) }?;
 
     // Try to open the slave
-    let _slave_fd = open(Path::new(&slave_name), OFlag::O_RDWR, Mode::empty())?;
+    //let _slave_fd = open(Path::new(&slave_name), OFlag::O_RDWR, Mode::empty())?;
+    {
+        let winsize = Winsize {
+            ws_row: 40,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
 
-    Command::new("vim")
-        .stdin(Stdio::inherit())
-        .stdout(unsafe { Stdio::from_raw_fd(_slave_fd) })
-        .stderr(unsafe { Stdio::from_raw_fd(_slave_fd) })
-        .spawn();
+        let master_fd = master_fd.clone().into_raw_fd();
+        unsafe { set_window_size(master_fd, &winsize).unwrap() };
+    }
+    match fork() {
+        Ok(ForkResult::Child) => {
+            setsid().unwrap(); // create new session with child as session leader
+            let slave_fd = open(Path::new(&slave_name), OFlag::O_RDWR, stat::Mode::empty())?;
+
+            // assign stdin, stdout, stderr to the tty, just like a terminal does
+            dup2(slave_fd, STDIN_FILENO).unwrap();
+            dup2(slave_fd, STDOUT_FILENO).unwrap();
+            dup2(slave_fd, STDERR_FILENO).unwrap();
+            std::process::Command::new("vim").status().unwrap();
+        }
+        Ok(ForkResult::Parent { child: _ }) => {}
+        Err(e) => panic!(e),
+    };
+
+    let stdin = unsafe { std::fs::File::from_raw_fd(master_fd.clone().into_raw_fd()) };
+    let stdin_ = unsafe { std::fs::File::from_raw_fd(master_fd.clone().into_raw_fd()) };
+    let grid = Arc::new(Mutex::new(CellBuffer::new(80, 40, Cell::default())));
+    let grid_ = grid.clone();
+    let terminal_size = (80, 40);
 
     std::thread::Builder::new()
         .spawn(move || {
-            let winsize = Winsize {
-                ws_row: 20,
-                ws_col: 80,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            //lock.write(b"\x1b3g").unwrap(); //clear all
             let master_fd = master_fd.into_raw_fd();
-            unsafe { set_window_size(master_fd, &winsize).unwrap() };
             let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
-            forward_pty_translate_escape_codes(master_file, area);
+            forward_pty_translate_escape_codes(master_file, area, grid_, stdin_);
         })
         .unwrap();
-    Ok(())
+    Ok(EmbedPty {
+        grid,
+        stdin,
+        terminal_size,
+    })
 }
 
 #[derive(Debug)]
-enum State {
+pub enum State {
     ExpectingControlChar,
     G0,            // Designate G0 Character Set
     Osc1(Vec<u8>), //ESC ] Operating System Command (OSC  is 0x9d).
@@ -70,6 +107,13 @@ enum State {
 }
 
 struct EscCode<'a>(&'a State, u8);
+
+impl<'a> From<(&'a mut State, u8)> for EscCode<'a> {
+    fn from(val: (&mut State, u8)) -> EscCode {
+        let (s, b) = val;
+        EscCode(s, b)
+    }
+}
 
 impl<'a> From<(&'a State, u8)> for EscCode<'a> {
     fn from(val: (&State, u8)) -> EscCode {
@@ -121,6 +165,15 @@ impl std::fmt::Display for EscCode<'_> {
                 f,
                 "ESC[{}n\t\tCSI Device Status Report (DSR)| Report Cursor Position",
                 unsafestr!(buf)
+            ),
+            EscCode(Csi1(ref buf), b't') if buf == b"18" => write!(
+                f,
+                "ESC[18t\t\tReport the size of the text area in characters",
+            ),
+            EscCode(Csi1(ref buf), b't') => write!(
+                f,
+                "ESC[{buf}t\t\tWindow manipulation, skipped",
+                buf = unsafestr!(buf)
             ),
             EscCode(Csi1(ref buf), b'B') => write!(
                 f,
@@ -208,7 +261,12 @@ impl std::fmt::Display for EscCode<'_> {
     }
 }
 
-fn forward_pty_translate_escape_codes(pty_fd: std::fs::File, area: Area) {
+fn forward_pty_translate_escape_codes(
+    pty_fd: std::fs::File,
+    area: Area,
+    grid: Arc<Mutex<CellBuffer>>,
+    stdin: std::fs::File,
+) {
     let (upper_left, bottom_right) = area;
     let (upper_x, upper_y) = upper_left;
     let (bottom_x, bottom_y) = bottom_right;
@@ -222,322 +280,18 @@ fn forward_pty_translate_escape_codes(pty_fd: std::fs::File, area: Area) {
     debug!(&upper_y_str);
     debug!(&bottom_x_str);
     debug!(&bottom_y_str);
-    let stdout = std::io::stdout();
-    let mut buf1: Vec<u8> = Vec::with_capacity(8);
-    let mut buf2: Vec<u8> = Vec::with_capacity(8);
-    let mut buf3: Vec<u8> = Vec::with_capacity(8);
-    let mut lock = stdout.lock();
-
-    let mut state = State::Normal;
+    let mut embed_grid = EmbedGrid::new(grid, stdin);
+    embed_grid.set_terminal_size((79, 39));
     let mut bytes_iter = pty_fd.bytes();
-    macro_rules! cleanup {
-        (CSIQ) => {
-            if let State::CsiQ(ref mut buf1_p) = state {
-                std::mem::swap(buf1_p, &mut buf1);
-            }
-        };
-        (CSI1) => {
-            if let State::Csi1(ref mut buf1_p) = state {
-                std::mem::swap(buf1_p, &mut buf1);
-            }
-        };
-        (CSI2) => {
-            if let State::Csi2(ref mut buf1_p, ref mut buf2_p) = state {
-                std::mem::swap(buf1_p, &mut buf1);
-                std::mem::swap(buf2_p, &mut buf2);
-            }
-        };
-        (CSI3) => {
-            if let State::Csi3(ref mut buf1_p, ref mut buf2_p, ref mut buf3_p) = state {
-                std::mem::swap(buf1_p, &mut buf1);
-                std::mem::swap(buf2_p, &mut buf2);
-                std::mem::swap(buf3_p, &mut buf3);
-            }
-        };
-        (OSC1) => {
-            if let State::Osc1(ref mut buf1_p) = state {
-                std::mem::swap(buf1_p, &mut buf1);
-            }
-        };
-        (OSC2) => {
-            if let State::Osc2(ref mut buf1_p, ref mut buf2_p) = state {
-                std::mem::swap(buf1_p, &mut buf1);
-                std::mem::swap(buf2_p, &mut buf2);
-            }
-        };
-    }
-
-    macro_rules! restore_global_buf {
-        ($b:ident) => {
-            let mut $b = std::mem::replace(&mut $b, Vec::new());
-            $b.clear();
-        };
-    }
-
     let mut prev_char = b'\0';
+    debug!("waiting for bytes");
     while let Some(Ok(byte)) = bytes_iter.next() {
+        debug!("got byte {}", byte as char);
         debug!(
             "{}{} byte is {} and state is {:?}",
-            prev_char as char, byte as char, byte as char, &state
+            prev_char as char, byte as char, byte as char, &embed_grid.state
         );
         prev_char = byte;
-        match (byte, &mut state) {
-            (b'\x1b', State::Normal) => {
-                state = State::ExpectingControlChar;
-            }
-            (b']', State::ExpectingControlChar) => {
-                restore_global_buf!(buf1);
-                state = State::Osc1(buf1);
-            }
-            (b'[', State::ExpectingControlChar) => {
-                state = State::Csi;
-            }
-            (b'(', State::ExpectingControlChar) => {
-                state = State::G0;
-            }
-            (c, State::ExpectingControlChar) => {
-                debug!(
-                    "unrecognised: byte is {} and state is {:?}",
-                    byte as char, &state
-                );
-                state = State::Normal;
-            }
-            (b'?', State::Csi) => {
-                restore_global_buf!(buf1);
-                state = State::CsiQ(buf1);
-            }
-            /* ********** */
-            /* ********** */
-            /* ********** */
-            /* OSC stuff */
-            (c, State::Osc1(ref mut buf)) if (c >= b'0' && c <= b'9') || c == b'?' => {
-                buf.push(c);
-            }
-            (b';', State::Osc1(ref mut buf1_p)) => {
-                let buf1 = std::mem::replace(buf1_p, Vec::new());
-                let mut buf2 = std::mem::replace(&mut buf2, Vec::new());
-                buf2.clear();
-                state = State::Osc2(buf1, buf2);
-            }
-            (c, State::Osc2(_, ref mut buf)) if (c >= b'0' && c <= b'9') || c == b'?' => {
-                buf.push(c);
-            }
-            (c, State::Osc1(ref buf1)) => {
-                lock.write_all(&[b'\x1b', b']']).unwrap();
-                lock.write_all(buf1).unwrap();
-                lock.write_all(&[c]).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                cleanup!(OSC1);
-                state = State::Normal;
-            }
-            (c, State::Osc2(ref buf1, ref buf2)) => {
-                lock.write_all(&[b'\x1b', b']']).unwrap();
-                lock.write_all(buf1).unwrap();
-                lock.write_all(&[b';']).unwrap();
-                lock.write_all(buf2).unwrap();
-                lock.write_all(&[c]).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                cleanup!(OSC2);
-                state = State::Normal;
-            }
-            /* END OF OSC */
-            /* ********** */
-            /* ********** */
-            /* ********** */
-            /* ********** */
-            (c, State::Normal) => {
-                lock.write(&[byte]).unwrap();
-                lock.flush().unwrap();
-            }
-            (b'u', State::Csi) => {
-                /* restore cursor */
-                lock.write_all(&[b'\x1b', b'[', b'u']).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                lock.flush().unwrap();
-                state = State::Normal;
-            }
-            (b'm', State::Csi) => {
-                /* Character Attributes (SGR).  Ps = 0  -> Normal (default), VT100 */
-                lock.write_all(&[b'\x1b', b'[', b'm']).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                lock.flush().unwrap();
-                state = State::Normal;
-            }
-            (b'H', State::Csi) => {
-                /*  move cursor to (1,1) */
-                lock.write_all(&[b'\x1b', b'[']).unwrap();
-                lock.write_all(upper_x_str.as_bytes()).unwrap();
-                lock.write_all(&[b';']).unwrap();
-                lock.write_all(upper_y_str.as_bytes()).unwrap();
-                lock.write_all(&[b'H']).unwrap();
-                debug!(
-                    "sending translating {} to ESC[{};{}H",
-                    EscCode::from((&state, byte)),
-                    upper_x_str,
-                    upper_y_str,
-                );
-                lock.flush().unwrap();
-                state = State::Normal;
-            }
-            /* CSI ? stuff */
-            (c, State::CsiQ(ref mut buf)) if c >= b'0' && c <= b'9' => {
-                buf.push(c);
-            }
-            (c, State::CsiQ(ref mut buf)) => {
-                // we are already in AlternativeScreen so do not forward this
-                if &buf.as_slice() != &SWITCHALTERNATIVE_1049 {
-                    lock.write_all(&[b'\x1b', b'[', b'?']).unwrap();
-                    lock.write_all(buf).unwrap();
-                    lock.write_all(&[c]).unwrap();
-                    debug!("sending {}", EscCode::from((&state, byte)));
-                }
-                cleanup!(CSIQ);
-                state = State::Normal;
-            }
-            /* END OF CSI ? stuff */
-            /* ******************* */
-            /* ******************* */
-            /* ******************* */
-            (c, State::Csi) if c >= b'0' && c <= b'9' => {
-                let mut buf1 = std::mem::replace(&mut buf1, Vec::new());
-                buf1.clear();
-                buf1.push(c);
-                state = State::Csi1(buf1);
-            }
-            (c, State::Csi) => {
-                lock.write_all(&[b'\x1b', b'[', c]).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                lock.flush().unwrap();
-                state = State::Normal;
-            }
-            (b'K', State::Csi1(_)) => {
-                /* Erase in Display (ED), VT100.*/
-                cleanup!(CSI1);
-                state = State::Normal;
-            }
-            (b'J', State::Csi1(_)) => {
-                /* Erase in Display (ED), VT100.*/
-                cleanup!(CSI1);
-                state = State::Normal;
-            }
-            (b't', State::Csi1(_)) => {
-                /* Window manipulation, skip it */
-                cleanup!(CSI1);
-                state = State::Normal;
-            }
-            (b';', State::Csi1(ref mut buf1_p)) => {
-                let buf1 = std::mem::replace(buf1_p, Vec::new());
-                let mut buf2 = std::mem::replace(&mut buf2, Vec::new());
-                buf2.clear();
-                state = State::Csi2(buf1, buf2);
-            }
-            (c, State::Csi1(ref mut buf)) if (c >= b'0' && c <= b'9') || c == b' ' => {
-                buf.push(c);
-            }
-            (c, State::Csi1(ref buf)) => {
-                lock.write_all(&[b'\x1b', b'[']).unwrap();
-                lock.write_all(buf).unwrap();
-                lock.write_all(&[c]).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                cleanup!(CSI1);
-                state = State::Normal;
-            }
-            (b';', State::Csi2(ref mut buf1_p, ref mut buf2_p)) => {
-                let buf1 = std::mem::replace(buf1_p, Vec::new());
-                let buf2 = std::mem::replace(buf2_p, Vec::new());
-                let mut buf3 = std::mem::replace(&mut buf3, Vec::new());
-                buf3.clear();
-                state = State::Csi3(buf1, buf2, buf3);
-            }
-            (b'n', State::Csi2(_, _)) => {
-                // Report Cursor Position, skip it
-                cleanup!(CSI2);
-                state = State::Normal;
-            }
-            (b't', State::Csi2(_, _)) => {
-                // Window manipulation, skip it
-                cleanup!(CSI2);
-                state = State::Normal;
-            }
-            (b'H', State::Csi2(ref x, ref y)) => {
-                //Cursor Position [row;column] (default = [1,1]) (CUP).
-                let orig_x = unsafe { std::str::from_utf8_unchecked(x) }
-                    .parse::<usize>()
-                    .unwrap();
-                let orig_y = unsafe { std::str::from_utf8_unchecked(y) }
-                    .parse::<usize>()
-                    .unwrap();
-                if orig_x + upper_x + 1 > bottom_x || orig_y + upper_y + 1 > bottom_y {
-                    debug!(orig_x);
-                    debug!(orig_y);
-                    debug!(area);
-                } else {
-                    debug!("orig_x + upper_x = {}", orig_x + upper_x);
-                    debug!("orig_y + upper_y = {}", orig_y + upper_y);
-                    lock.write_all(&[b'\x1b', b'[']).unwrap();
-                    lock.write_all((orig_x + upper_x).to_string().as_bytes())
-                        .unwrap();
-                    lock.write_all(&[b';']).unwrap();
-                    lock.write_all((orig_y + upper_y).to_string().as_bytes())
-                        .unwrap();
-                    lock.write_all(&[b'H']).unwrap();
-                    debug!(
-                        "sending translating {} to ESC[{};{}H ",
-                        EscCode::from((&state, byte)),
-                        orig_x + upper_x,
-                        orig_y + upper_y
-                    );
-                }
-                cleanup!(CSI2);
-                state = State::Normal;
-            }
-            (c, State::Csi2(_, ref mut buf)) if c >= b'0' && c <= b'9' => {
-                buf.push(c);
-            }
-            (c, State::Csi2(ref buf1, ref buf2)) => {
-                lock.write_all(&[b'\x1b', b'[']).unwrap();
-                lock.write_all(buf1).unwrap();
-                lock.write_all(&[b';']).unwrap();
-                lock.write_all(buf2).unwrap();
-                lock.write_all(&[c]).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                cleanup!(CSI2);
-                state = State::Normal;
-            }
-            (b't', State::Csi3(_, _, _)) => {
-                // Window manipulation, skip it
-                cleanup!(CSI3);
-                state = State::Normal;
-            }
-
-            (c, State::Csi3(_, _, ref mut buf)) if c >= b'0' && c <= b'9' => {
-                buf.push(c);
-            }
-            (c, State::Csi3(ref buf1, ref buf2, ref buf3)) => {
-                lock.write_all(&[b'\x1b', b'[']).unwrap();
-                lock.write_all(buf1).unwrap();
-                lock.write_all(&[b';']).unwrap();
-                lock.write_all(buf2).unwrap();
-                lock.write_all(&[b';']).unwrap();
-                lock.write_all(buf3).unwrap();
-                lock.write_all(&[c]).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                cleanup!(CSI3);
-                state = State::Normal;
-            }
-            /* other stuff */
-            /* ******************* */
-            /* ******************* */
-            /* ******************* */
-            (c, State::G0) => {
-                lock.write_all(&[b'\x1b', b'(']).unwrap();
-                lock.write_all(&[c]).unwrap();
-                debug!("sending {}", EscCode::from((&state, byte)));
-                state = State::Normal;
-            }
-            (b, s) => {
-                debug!("unrecognised: byte is {} and state is {:?}", b as char, s);
-            }
-        }
+        embed_grid.process_byte(byte);
     }
 }

@@ -303,10 +303,13 @@ fn main() -> std::result::Result<(), std::io::Error> {
                                         },
                                     }
                                 },
+                                UIMode::Embed => {
+                                    state.rcv_event(UIEvent::EmbedInput(k));
+                                    state.redraw();
+                                },
                                 UIMode::Fork => {
                                     break 'inner; // `goto` 'reap loop, and wait on child.
                                 },
-                                UIMode::Embed => {}
                             }
                         },
                         ThreadEvent::RefreshMailbox(event) => {
