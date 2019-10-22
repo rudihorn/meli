@@ -21,16 +21,43 @@
 
 use super::*;
 
-use crate::terminal::embed::EmbedPty;
+use crate::terminal::embed::EmbedGrid;
 use melib::Draft;
 use mime_apps::query_mime_info;
+use nix::sys::wait::WaitStatus;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, PartialEq)]
 enum Cursor {
     Headers,
     Body,
     //Attachments,
+}
+
+#[derive(Debug)]
+enum EmbedStatus {
+    Stopped(Arc<Mutex<EmbedGrid>>, File),
+    Running(Arc<Mutex<EmbedGrid>>, File),
+}
+
+impl std::ops::Deref for EmbedStatus {
+    type Target = Arc<Mutex<EmbedGrid>>;
+    fn deref(&self) -> &Arc<Mutex<EmbedGrid>> {
+        use EmbedStatus::*;
+        match self {
+            Stopped(ref e, _) | Running(ref e, _) => e,
+        }
+    }
+}
+
+impl std::ops::DerefMut for EmbedStatus {
+    fn deref_mut(&mut self) -> &mut Arc<Mutex<EmbedGrid>> {
+        use EmbedStatus::*;
+        match self {
+            Stopped(ref mut e, _) | Running(ref mut e, _) => e,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -47,7 +74,7 @@ pub struct Composer {
     mode: ViewMode,
 
     body_area: Area, // Cache body_area in case we need to replace it with a pseudoterminal
-    embed: Option<EmbedPty>,
+    embed: Option<EmbedStatus>,
     sign_mail: ToggleFlag,
     dirty: bool,
     has_changes: bool,
@@ -83,6 +110,7 @@ impl Default for Composer {
 enum ViewMode {
     Discard(Uuid, Selector<char>),
     Edit,
+    Embed,
     SelectRecipients(Selector<Address>),
     ThreadView,
 }
@@ -98,6 +126,14 @@ impl ViewMode {
 
     fn is_threadview(&self) -> bool {
         if let ViewMode::ThreadView = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_embed(&self) -> bool {
+        if let ViewMode::Embed = self {
             true
         } else {
             false
@@ -217,10 +253,9 @@ impl Composer {
     fn update_draft(&mut self) {
         let header_values = self.form.values_mut();
         let draft_header_map = self.draft.headers_mut();
-        /* avoid extra allocations by updating values instead of inserting */
         for (k, v) in draft_header_map.iter_mut() {
-            if let Some(vn) = header_values.remove(k) {
-                std::mem::swap(v, &mut vn.into_string());
+            if let Some(ref vn) = header_values.get(k) {
+                *v = vn.as_str().to_string();
             }
         }
     }
@@ -510,8 +545,48 @@ impl Component for Composer {
 
         /* Regardless of view mode, do the following */
         self.form.draw(grid, header_area, context);
-        self.pager.set_dirty();
-        self.pager.draw(grid, body_area, context);
+        if let Some(ref mut embed_pty) = self.embed {
+            if self.dirty {
+                clear_area(grid, body_area);
+                match embed_pty {
+                    EmbedStatus::Running(_, _) => {
+                        let mut guard = embed_pty.lock().unwrap();
+                        copy_area(
+                            grid,
+                            &guard.grid,
+                            body_area,
+                            ((0, 0), pos_dec(guard.terminal_size, (1, 1))),
+                        );
+                        if body_area != self.body_area {
+                            guard.set_terminal_size((width!(body_area), height!(body_area)));
+                        }
+                        context.dirty_areas.push_back(body_area);
+                        self.dirty = false;
+                        return;
+                    }
+                    EmbedStatus::Stopped(_, _) => {
+                        write_string_to_grid(
+                            "process has stopped, press 'e' to re-activate",
+                            grid,
+                            Color::Default,
+                            Color::Default,
+                            Attr::Default,
+                            body_area,
+                            false,
+                        );
+                        context.dirty_areas.push_back(body_area);
+                        self.dirty = false;
+                        return;
+                    }
+                }
+            }
+        } else {
+            self.pager.set_dirty();
+            self.pager.draw(grid, body_area, context);
+        }
+
+        self.body_area = body_area;
+
         if self.cursor == Cursor::Body {
             change_colors(
                 grid,
@@ -533,28 +608,9 @@ impl Component for Composer {
                 Color::Default,
             );
         }
-        self.body_area = body_area;
-        if let Some(ref mut embed_pty) = self.embed {
-            let lock = embed_pty.grid.lock().unwrap();
-            copy_area(
-                grid,
-                &lock,
-                area,
-                ((0, 0), pos_dec(embed_pty.terminal_size, (1, 1))),
-            );
-            for y in 0..embed_pty.terminal_size.1 {
-                for x in 0..embed_pty.terminal_size.0 {
-                    if lock[(x, y)].ch() != ' ' {
-                        debug!("coors {:?} char = {}", (x, y), lock[(x, y)].ch());
-                    }
-                }
-            }
-            context.dirty_areas.push_back(area);
-            debug!("copied grid");
-        }
 
         match self.mode {
-            ViewMode::ThreadView | ViewMode::Edit => {}
+            ViewMode::ThreadView | ViewMode::Edit | ViewMode::Embed => {}
             ViewMode::SelectRecipients(ref mut s) => {
                 s.draw(grid, center_area(area, s.content.size()), context);
             }
@@ -769,31 +825,158 @@ impl Component for Composer {
                 }
                 return true;
             }
-            UIEvent::EmbedInput(Key::Char(c)) => {
-                debug!("got embed input {:?}", event);
-                let mut buf: [u8; 4] = [0; 4];
-                let s = c.encode_utf8(&mut buf);
+            UIEvent::ChildStatusExited(ref pid, ref exit_code)
+                if self.embed.is_some()
+                    && *pid
+                        == self
+                            .embed
+                            .as_ref()
+                            .map(|e| e.lock().unwrap().child_pid)
+                            .unwrap() =>
+            {
+                self.embed = None;
+                self.mode = ViewMode::Edit;
+                context
+                    .replies
+                    .push_back(UIEvent::ChangeMode(UIMode::Normal));
+            }
+            UIEvent::ChildStatusStopped(ref pid)
+                if self.embed.is_some()
+                    && *pid
+                        == self
+                            .embed
+                            .as_ref()
+                            .map(|e| e.lock().unwrap().child_pid)
+                            .unwrap() =>
+            {
+                match self.embed.take() {
+                    Some(EmbedStatus::Running(e, f)) | Some(EmbedStatus::Stopped(e, f)) => {
+                        self.embed = Some(EmbedStatus::Stopped(e, f));
+                    }
+                    _ => {}
+                }
+                context
+                    .replies
+                    .push_back(UIEvent::ChangeMode(UIMode::Normal));
+            }
+            UIEvent::ChildStatusContinued(ref pid)
+                if self.embed.is_some()
+                    && *pid
+                        == self
+                            .embed
+                            .as_ref()
+                            .map(|e| e.lock().unwrap().child_pid)
+                            .unwrap() =>
+            {
+                match self.embed.take() {
+                    Some(EmbedStatus::Running(e, f)) | Some(EmbedStatus::Stopped(e, f)) => {
+                        self.embed = Some(EmbedStatus::Running(e, f));
+                    }
+                    _ => {}
+                }
+                context
+                    .replies
+                    .push_back(UIEvent::ChangeMode(UIMode::Embed));
+            }
 
+            UIEvent::EmbedInput((Key::Ctrl('z'), _)) => {
+                self.embed.as_ref().unwrap().lock().unwrap().stop();
+                context
+                    .replies
+                    .push_back(UIEvent::ChangeMode(UIMode::Normal));
+            }
+            UIEvent::EmbedInput((ref k, ref b)) => {
                 use std::io::Write;
-                self.embed
-                    .as_mut()
-                    .unwrap()
-                    .stdin
-                    .write_all(s.as_bytes())
-                    .unwrap();
+                if let Some(ref mut embed) = self.embed {
+                    let mut embed_guard = embed.lock().unwrap();
+                    if embed_guard.stdin.write_all(b).is_err() {
+                        match embed_guard.is_active() {
+                            Ok(WaitStatus::Exited(_, exit_code)) => {
+                                drop(embed_guard);
+                                if exit_code != 0 {
+                                    context.replies.push_back(UIEvent::Notification(
+                                        None,
+                                        format!(
+                                            "Subprocess has exited with exit code {}",
+                                            exit_code
+                                        ),
+                                        Some(NotificationType::ERROR),
+                                    ));
+                                } else if let EmbedStatus::Running(_, f) = embed {
+                                    let result = f.read_to_string();
+                                    match Draft::from_str(result.as_str()) {
+                                        Ok(mut new_draft) => {
+                                            std::mem::swap(
+                                                self.draft.attachments_mut(),
+                                                new_draft.attachments_mut(),
+                                            );
+                                            if self.draft != new_draft {
+                                                self.has_changes = true;
+                                            }
+                                            self.draft = new_draft;
+                                        }
+                                        Err(_) => {
+                                            context.replies.push_back(UIEvent::Notification(
+                                                    None,
+                                                    "Could not parse draft headers correctly. The invalid text has been set as the body of your draft".to_string(),
+                                                    Some(NotificationType::ERROR),
+                                                    ));
+                                        }
+                                    }
+                                    self.initialized = false;
+                                }
+                                self.embed = None;
+                                self.mode = ViewMode::Edit;
+                                context
+                                    .replies
+                                    .push_back(UIEvent::ChangeMode(UIMode::Normal));
+                            }
+                            Ok(WaitStatus::Stopped(_, _)) => {
+                                drop(embed_guard);
+                                match self.embed.take() {
+                                    Some(EmbedStatus::Running(e, f))
+                                    | Some(EmbedStatus::Stopped(e, f)) => {
+                                        self.embed = Some(EmbedStatus::Stopped(e, f));
+                                    }
+                                    _ => {}
+                                }
+                                self.dirty = true;
+                                return true;
+                            }
+                            Ok(WaitStatus::Continued(_)) | Ok(WaitStatus::StillAlive) => {
+                                context
+                                    .replies
+                                    .push_back(UIEvent::EmbedInput((k.clone(), b.to_vec())));
+                                return true;
+                            }
+                            e => {
+                                context.replies.push_back(UIEvent::Notification(
+                                    None,
+                                    format!("Subprocess has exited with reason {:?}", e),
+                                    Some(NotificationType::ERROR),
+                                ));
+                                drop(embed_guard);
+                                self.embed = None;
+                                self.mode = ViewMode::Edit;
+                                context
+                                    .replies
+                                    .push_back(UIEvent::ChangeMode(UIMode::Normal));
+                            }
+                        }
+                    }
+                }
                 self.dirty = true;
                 return true;
             }
-            UIEvent::Input(Key::Char('e')) => {
-                /* Edit draft in $EDITOR */
-                use std::process::{Command, Stdio};
-                self.embed = Some(crate::terminal::embed::create_pty(self.body_area).unwrap());
-                self.dirty = true;
-                debug!("returned");
+            UIEvent::Input(Key::Char('e')) if self.mode.is_embed() => {
+                self.embed.as_ref().unwrap().lock().unwrap().wake_up();
                 context
                     .replies
                     .push_back(UIEvent::ChangeMode(UIMode::Embed));
                 return true;
+            }
+            UIEvent::Input(Key::Char('e')) => {
+                /* Edit draft in $EDITOR */
                 let settings = &context.settings;
                 let editor = if let Some(editor_cmd) = settings.composing.editor_cmd.as_ref() {
                     editor_cmd.to_string()
@@ -810,18 +993,36 @@ impl Component for Composer {
                         Ok(v) => v,
                     }
                 };
-                /* Kill input thread so that spawned command can be sole receiver of stdin */
-                {
-                    context.input_kill();
-                }
                 /* update Draft's headers based on form values */
                 self.update_draft();
                 let f = create_temp_file(
                     self.draft.to_string().unwrap().as_str().as_bytes(),
                     None,
                     None,
-                    true,
+                    false,
                 );
+
+                if settings.composing.embed {
+                    self.embed = Some(EmbedStatus::Running(
+                        crate::terminal::embed::create_pty(
+                            self.body_area,
+                            [editor, f.path().display().to_string()].join(" "),
+                        )
+                        .unwrap(),
+                        f,
+                    ));
+                    self.dirty = true;
+                    context
+                        .replies
+                        .push_back(UIEvent::ChangeMode(UIMode::Embed));
+                    self.mode = ViewMode::Embed;
+                    return true;
+                }
+                use std::process::{Command, Stdio};
+                /* Kill input thread so that spawned command can be sole receiver of stdin */
+                {
+                    context.input_kill();
+                }
 
                 let parts = split_command!(editor);
                 let (cmd, args) = (parts[0], &parts[1..]);

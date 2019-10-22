@@ -48,6 +48,8 @@ pub enum ThreadEvent {
     ThreadJoin(thread::ThreadId),
     /// User input.
     Input(Key),
+    /// User input and input as raw bytes.
+    InputRaw((Key, Vec<u8>)),
     /// A watched folder has been refreshed.
     RefreshMailbox(Box<RefreshEvent>),
     UIEvent(UIEvent),
@@ -84,9 +86,11 @@ pub enum UIEvent {
     Input(Key),
     ExInput(Key),
     InsertInput(Key),
-    EmbedInput(Key),
+    EmbedInput((Key, Vec<u8>)),
     RefreshMailbox((usize, FolderHash)), //view has changed to FolderHash mailbox
-    //Quit?
+    ChildStatusExited(nix::unistd::Pid, i32),
+    ChildStatusStopped(nix::unistd::Pid),
+    ChildStatusContinued(nix::unistd::Pid),
     Resize,
     /// Force redraw.
     Fork(ForkType),

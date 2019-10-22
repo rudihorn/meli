@@ -1,17 +1,27 @@
+use crate::split_command;
 use crate::terminal::position::Area;
+use crate::terminal::position::*;
+use melib::log;
+use melib::ERROR;
+
 use nix::fcntl::{open, OFlag};
 use nix::ioctl_write_ptr_bad;
 use nix::libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, Winsize};
 use nix::sys::stat::Mode;
-use nix::sys::{stat, wait};
-use nix::unistd::{dup2, fork, setsid, ForkResult};
+use nix::sys::{
+    stat,
+    wait::{self, waitpid},
+};
+use nix::unistd::{dup2, fork, setsid, ForkResult, Pid};
+use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
 mod grid;
 
 use crate::terminal::cells::{Cell, CellBuffer};
-pub use grid::*;
+pub use grid::EmbedGrid;
+use grid::*;
 
 // ioctl command to set window size of pty:
 use libc::TIOCSWINSZ;
@@ -26,14 +36,7 @@ ioctl_write_ptr_bad!(set_window_size, TIOCSWINSZ, Winsize);
 
 static SWITCHALTERNATIVE_1049: &'static [u8] = &[b'1', b'0', b'4', b'9'];
 
-#[derive(Debug)]
-pub struct EmbedPty {
-    pub grid: Arc<Mutex<CellBuffer>>,
-    pub stdin: std::fs::File,
-    pub terminal_size: (usize, usize),
-}
-
-pub fn create_pty(area: Area) -> nix::Result<EmbedPty> {
+pub fn create_pty(area: Area, command: String) -> nix::Result<Arc<Mutex<EmbedGrid>>> {
     // Open a new PTY master
     let master_fd = posix_openpt(OFlag::O_RDWR)?;
 
@@ -48,7 +51,7 @@ pub fn create_pty(area: Area) -> nix::Result<EmbedPty> {
     //let _slave_fd = open(Path::new(&slave_name), OFlag::O_RDWR, Mode::empty())?;
     {
         let winsize = Winsize {
-            ws_row: 40,
+            ws_row: 20,
             ws_col: 80,
             ws_xpixel: 0,
             ws_ypixel: 0,
@@ -57,39 +60,66 @@ pub fn create_pty(area: Area) -> nix::Result<EmbedPty> {
         let master_fd = master_fd.clone().into_raw_fd();
         unsafe { set_window_size(master_fd, &winsize).unwrap() };
     }
-    match fork() {
+
+    let child_pid = match fork() {
         Ok(ForkResult::Child) => {
-            setsid().unwrap(); // create new session with child as session leader
+            /* Open slave end for pseudoterminal */
             let slave_fd = open(Path::new(&slave_name), OFlag::O_RDWR, stat::Mode::empty())?;
 
-            // assign stdin, stdout, stderr to the tty, just like a terminal does
-            dup2(slave_fd, STDIN_FILENO).unwrap();
-            dup2(slave_fd, STDOUT_FILENO).unwrap();
-            dup2(slave_fd, STDERR_FILENO).unwrap();
-            std::process::Command::new("vim").status().unwrap();
+            let child_pid = match fork() {
+                Ok(ForkResult::Child) => {
+                    // assign stdin, stdout, stderr to the tty, just like a terminal does
+                    dup2(slave_fd, STDIN_FILENO).unwrap();
+                    dup2(slave_fd, STDOUT_FILENO).unwrap();
+                    dup2(slave_fd, STDERR_FILENO).unwrap();
+                    let parts = split_command!(command);
+                    let (cmd, _) = (parts[0], &parts[1..]);
+                    if let Err(e) = nix::unistd::execv(
+                        &CString::new(cmd).unwrap(),
+                        &parts
+                            .iter()
+                            .map(|&a| CString::new(a).unwrap())
+                            .collect::<Vec<CString>>(),
+                    ) {
+                        log(format!("Could not execute `{}`: {}", command, e,), ERROR);
+                        std::process::exit(-1);
+                    }
+                    /* This path shouldn't be executed. */
+                    std::process::exit(0);
+                }
+                Ok(ForkResult::Parent { child }) => child,
+                Err(e) => panic!(e),
+            };
+            waitpid(child_pid, None).unwrap();
+            std::process::exit(0);
         }
-        Ok(ForkResult::Parent { child: _ }) => {}
+        Ok(ForkResult::Parent { child }) => child,
         Err(e) => panic!(e),
     };
 
     let stdin = unsafe { std::fs::File::from_raw_fd(master_fd.clone().into_raw_fd()) };
-    let stdin_ = unsafe { std::fs::File::from_raw_fd(master_fd.clone().into_raw_fd()) };
-    let grid = Arc::new(Mutex::new(CellBuffer::new(80, 40, Cell::default())));
+    let mut embed_grid = EmbedGrid::new(stdin, child_pid);
+    embed_grid.set_terminal_size((width!(area), height!(area)));
+    let grid = Arc::new(Mutex::new(embed_grid));
     let grid_ = grid.clone();
-    let terminal_size = (80, 40);
 
     std::thread::Builder::new()
         .spawn(move || {
             let master_fd = master_fd.into_raw_fd();
             let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
-            forward_pty_translate_escape_codes(master_file, area, grid_, stdin_);
+            forward_pty_translate_escape_codes(master_file, grid_);
         })
         .unwrap();
-    Ok(EmbedPty {
-        grid,
-        stdin,
-        terminal_size,
-    })
+    Ok(grid)
+}
+
+fn forward_pty_translate_escape_codes(pty_fd: std::fs::File, grid: Arc<Mutex<EmbedGrid>>) {
+    let mut bytes_iter = pty_fd.bytes();
+    debug!("waiting for bytes");
+    while let Some(Ok(byte)) = bytes_iter.next() {
+        debug!("got byte {}", byte as char);
+        grid.lock().unwrap().process_byte(byte);
+    }
 }
 
 #[derive(Debug)]
@@ -131,6 +161,7 @@ impl std::fmt::Display for EscCode<'_> {
             };
         }
         match self {
+            EscCode(G0, b'B') => write!(f, "ESC(B\t\tG0 USASCII charset set"),
             EscCode(G0, c) => write!(f, "ESC({}\t\tG0 charset set", *c as char),
             EscCode(Osc1(ref buf), ref c) => {
                 write!(f, "ESC]{}{}\t\tOSC", unsafestr!(buf), *c as char)
@@ -148,13 +179,13 @@ impl std::fmt::Display for EscCode<'_> {
             ),
             EscCode(Csi, b'K') => write!(
                 f,
-                "ESC[K\t\tCSI Erase from the cursor to the end of the line [BAD]"
+                "ESC[K\t\tCSI Erase from the cursor to the end of the line"
             ),
             EscCode(Csi, b'J') => write!(
                 f,
-                "ESC[J\t\tCSI Erase from the cursor to the end of the screen [BAD]"
+                "ESC[J\t\tCSI Erase from the cursor to the end of the screen"
             ),
-            EscCode(Csi, b'H') => write!(f, "ESC[H\t\tCSI Move the cursor to home position. [BAD]"),
+            EscCode(Csi, b'H') => write!(f, "ESC[H\t\tCSI Move the cursor to home position."),
             EscCode(Csi, c) => write!(f, "ESC[{}\t\tCSI [UNKNOWN]", *c as char),
             EscCode(Csi1(ref buf), b'm') => write!(
                 f,
@@ -205,9 +236,31 @@ impl std::fmt::Display for EscCode<'_> {
                 "ESC[{buf}G\t\tCursor Character Absolute  [column={buf}] (default = [row,1])",
                 buf = unsafestr!(buf)
             ),
+
+            EscCode(Csi1(ref buf), b'P') => write!(
+                f,
+                "ESC[{buf}P\t\tDelete P s Character(s) (default = 1) (DCH).  ",
+                buf = unsafestr!(buf)
+            ),
+            EscCode(Csi1(ref buf), b'S') => write!(
+                f,
+                "ESC[{buf}S\t\tCSI P s S Scroll up P s lines (default = 1) (SU), VT420, EC",
+                buf = unsafestr!(buf)
+            ),
+            EscCode(Csi1(ref buf), b'J') => write!(
+                f,
+                "Erase in display {buf}",
+                buf = unsafestr!(buf)
+            ),
             EscCode(Csi1(ref buf), c) => {
                 write!(f, "ESC[{}{}\t\tCSI [UNKNOWN]", unsafestr!(buf), *c as char)
             }
+            EscCode(Csi2(ref buf1, ref buf2), b'r') => write!(
+                f,
+                "ESC[{};{}r\t\tCSI Set Scrolling Region [top;bottom] (default = full size of window) (DECSTBM), VT100.",
+                unsafestr!(buf1),
+                unsafestr!(buf2),
+            ),
             EscCode(Csi2(ref buf1, ref buf2), c) => write!(
                 f,
                 "ESC[{};{}{}\t\tCSI",
@@ -240,16 +293,24 @@ impl std::fmt::Display for EscCode<'_> {
                 "ESC[?{}r\t\tCSI Restore DEC Private Mode Values",
                 unsafestr!(buf)
             ),
-            EscCode(CsiQ(ref buf), b'h') if buf == &[b'2', b'5'] => write!(
+            EscCode(CsiQ(ref buf), b'h') if buf == b"25" => write!(
                 f,
                 "ESC[?25h\t\tCSI DEC Private Mode Set (DECSET) show cursor",
+            ),
+            EscCode(CsiQ(ref buf), b'h') if buf == b"12" => write!(
+                f,
+                "ESC[?12h\t\tCSI DEC Private Mode Set (DECSET) Start Blinking Cursor.",
             ),
             EscCode(CsiQ(ref buf), b'h') => write!(
                 f,
                 "ESC[?{}h\t\tCSI DEC Private Mode Set (DECSET). [UNKNOWN]",
                 unsafestr!(buf)
             ),
-            EscCode(CsiQ(ref buf), b'l') if buf == &[b'2', b'5'] => write!(
+            EscCode(CsiQ(ref buf), b'l') if buf == b"12" => write!(
+                f,
+                "ESC[?12l\t\tCSI DEC Private Mode Set (DECSET) Stop Blinking Cursor",
+            ),
+            EscCode(CsiQ(ref buf), b'l') if buf == b"25" => write!(
                 f,
                 "ESC[?25l\t\tCSI DEC Private Mode Set (DECSET) hide cursor",
             ),
@@ -258,40 +319,5 @@ impl std::fmt::Display for EscCode<'_> {
             }
             _ => unreachable!(),
         }
-    }
-}
-
-fn forward_pty_translate_escape_codes(
-    pty_fd: std::fs::File,
-    area: Area,
-    grid: Arc<Mutex<CellBuffer>>,
-    stdin: std::fs::File,
-) {
-    let (upper_left, bottom_right) = area;
-    let (upper_x, upper_y) = upper_left;
-    let (bottom_x, bottom_y) = bottom_right;
-    let upper_x_str = upper_x.to_string();
-    let upper_y_str = upper_y.to_string();
-    let bottom_x_str = bottom_x.to_string();
-    let bottom_y_str = bottom_y.to_string();
-
-    debug!(area);
-    debug!(&upper_x_str);
-    debug!(&upper_y_str);
-    debug!(&bottom_x_str);
-    debug!(&bottom_y_str);
-    let mut embed_grid = EmbedGrid::new(grid, stdin);
-    embed_grid.set_terminal_size((79, 39));
-    let mut bytes_iter = pty_fd.bytes();
-    let mut prev_char = b'\0';
-    debug!("waiting for bytes");
-    while let Some(Ok(byte)) = bytes_iter.next() {
-        debug!("got byte {}", byte as char);
-        debug!(
-            "{}{} byte is {} and state is {:?}",
-            prev_char as char, byte as char, byte as char, &embed_grid.state
-        );
-        prev_char = byte;
-        embed_grid.process_byte(byte);
     }
 }

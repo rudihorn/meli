@@ -139,8 +139,17 @@ impl PartialEq<Key> for &Key {
 enum InputMode {
     Normal,
     Paste,
+    PasteRaw(Vec<u8>),
 }
 
+pub enum InputCommand {
+    Kill,
+    /// Send Raw bytes as well
+    Raw,
+    NoRaw,
+}
+
+use termion::input::TermReadEventsAndRaw;
 /*
  * If we fork (for example start $EDITOR) we want the input-thread to stop reading from stdin. The
  * best way I came up with right now is to send a signal to the thread that is read in the first
@@ -150,22 +159,21 @@ enum InputMode {
  * The main loop uses try_wait_on_child() to check if child has exited.
  */
 pub fn get_events(
-    stdin: io::Stdin,
     mut closure: impl FnMut(Key),
-    mut exit: impl FnMut(),
-    rx: &Receiver<bool>,
-) {
+    closure_raw: impl FnMut((Key, Vec<u8>)),
+    rx: &Receiver<InputCommand>,
+) -> ! {
+    let stdin = std::io::stdin();
     let mut input_mode = InputMode::Normal;
     let mut paste_buf = String::with_capacity(256);
     for c in stdin.events() {
         select! {
             default => {},
-            recv(rx) -> val => {
-                if let Ok(true) = val {
-                    exit();
-                    return;
-                } else {
-                    return;
+            recv(rx) -> cmd => {
+                match cmd.unwrap() {
+                    InputCommand::Kill => std::process::exit(0),
+                    InputCommand::Raw => get_events_raw(closure, closure_raw, rx),
+                    InputCommand::NoRaw => unreachable!(),
                 }
             }
         };
@@ -189,6 +197,59 @@ pub fn get_events(
             _ => {} // Mouse events or errors.
         }
     }
+    std::process::exit(0)
+}
+
+pub fn get_events_raw(
+    closure_nonraw: impl FnMut(Key),
+    mut closure: impl FnMut((Key, Vec<u8>)),
+    rx: &Receiver<InputCommand>,
+) -> ! {
+    let stdin = std::io::stdin();
+    let mut input_mode = InputMode::Normal;
+    let mut paste_buf = String::with_capacity(256);
+    for c in stdin.events_and_raw() {
+        select! {
+            default => {},
+            recv(rx) -> cmd => {
+                match cmd.unwrap() {
+                    InputCommand::Kill => std::process::exit(0),
+                    InputCommand::NoRaw => get_events(closure_nonraw, closure, rx),
+                    InputCommand::Raw => unreachable!(),
+                }
+            }
+        };
+
+        match (c, &mut input_mode) {
+            (Ok((TermionEvent::Key(k), bytes)), InputMode::Normal) => {
+                closure((Key::from(k), bytes));
+            }
+            (
+                Ok((TermionEvent::Key(TermionKey::Char(k)), ref mut bytes)),
+                InputMode::PasteRaw(ref mut buf),
+            ) => {
+                paste_buf.push(k);
+                let bytes = std::mem::replace(bytes, Vec::new());
+                buf.extend(bytes.into_iter());
+            }
+            (Ok((TermionEvent::Unsupported(ref k), _)), _)
+                if k.as_slice() == BRACKET_PASTE_START =>
+            {
+                input_mode = InputMode::PasteRaw(Vec::new());
+            }
+            (Ok((TermionEvent::Unsupported(ref k), _)), InputMode::PasteRaw(ref mut buf))
+                if k.as_slice() == BRACKET_PASTE_END =>
+            {
+                let buf = std::mem::replace(buf, Vec::new());
+                input_mode = InputMode::Normal;
+                let ret = Key::from(&paste_buf);
+                paste_buf.clear();
+                closure((ret, buf));
+            }
+            _ => {} // Mouse events or errors.
+        }
+    }
+    std::process::exit(0)
 }
 const FIELDS: &[&str] = &[];
 
