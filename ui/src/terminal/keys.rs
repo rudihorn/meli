@@ -22,7 +22,6 @@
 use super::*;
 use crossbeam::{channel::Receiver, select};
 use serde::{Serialize, Serializer};
-use std::io;
 use termion::event::Event as TermionEvent;
 use termion::event::Key as TermionKey;
 use termion::input::TermRead;

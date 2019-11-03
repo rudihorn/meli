@@ -8,33 +8,25 @@ use nix::fcntl::{open, OFlag};
 use nix::ioctl_write_ptr_bad;
 use nix::libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, Winsize};
-use nix::sys::stat::Mode;
-use nix::sys::{
-    stat,
-    wait::{self, waitpid},
-};
-use nix::unistd::{dup2, fork, setsid, ForkResult, Pid};
+use nix::sys::{stat, wait::waitpid};
+use nix::unistd::{dup2, fork, ForkResult};
 use std::ffi::CString;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
 mod grid;
 
-use crate::terminal::cells::{Cell, CellBuffer};
 pub use grid::EmbedGrid;
-use grid::*;
 
 // ioctl command to set window size of pty:
 use libc::TIOCSWINSZ;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use std::io::Read;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+// Macro generated function that calls ioctl to set window size of slave pty end
 ioctl_write_ptr_bad!(set_window_size, TIOCSWINSZ, Winsize);
-
-static SWITCHALTERNATIVE_1049: &'static [u8] = &[b'1', b'0', b'4', b'9'];
 
 pub fn create_pty(area: Area, command: String) -> nix::Result<Arc<Mutex<EmbedGrid>>> {
     // Open a new PTY master
@@ -68,7 +60,7 @@ pub fn create_pty(area: Area, command: String) -> nix::Result<Arc<Mutex<EmbedGri
 
             let child_pid = match fork() {
                 Ok(ForkResult::Child) => {
-                    // assign stdin, stdout, stderr to the tty, just like a terminal does
+                    // assign stdin, stdout, stderr to the tty
                     dup2(slave_fd, STDIN_FILENO).unwrap();
                     dup2(slave_fd, STDOUT_FILENO).unwrap();
                     dup2(slave_fd, STDERR_FILENO).unwrap();
@@ -136,6 +128,7 @@ pub enum State {
     Normal,
 }
 
+/* Used for debugging */
 struct EscCode<'a>(&'a State, u8);
 
 impl<'a> From<(&'a mut State, u8)> for EscCode<'a> {
@@ -317,7 +310,9 @@ impl std::fmt::Display for EscCode<'_> {
             EscCode(CsiQ(ref buf), c) => {
                 write!(f, "ESC[?{}{}\t\tCSI [UNKNOWN]", unsafestr!(buf), *c as char)
             }
-            _ => unreachable!(),
+            EscCode(unknown, c) => {
+                write!(f, "{:?}{} [UNKNOWN]", unknown, c)
+            }
         }
     }
 }

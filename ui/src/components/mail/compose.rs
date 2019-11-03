@@ -546,38 +546,34 @@ impl Component for Composer {
         /* Regardless of view mode, do the following */
         self.form.draw(grid, header_area, context);
         if let Some(ref mut embed_pty) = self.embed {
-            if self.dirty {
-                clear_area(grid, body_area);
-                match embed_pty {
-                    EmbedStatus::Running(_, _) => {
-                        let mut guard = embed_pty.lock().unwrap();
-                        copy_area(
-                            grid,
-                            &guard.grid,
-                            body_area,
-                            ((0, 0), pos_dec(guard.terminal_size, (1, 1))),
-                        );
-                        if body_area != self.body_area {
-                            guard.set_terminal_size((width!(body_area), height!(body_area)));
-                        }
-                        context.dirty_areas.push_back(body_area);
-                        self.dirty = false;
-                        return;
-                    }
-                    EmbedStatus::Stopped(_, _) => {
-                        write_string_to_grid(
-                            "process has stopped, press 'e' to re-activate",
-                            grid,
-                            Color::Default,
-                            Color::Default,
-                            Attr::Default,
-                            body_area,
-                            false,
-                        );
-                        context.dirty_areas.push_back(body_area);
-                        self.dirty = false;
-                        return;
-                    }
+            clear_area(grid, body_area);
+            match embed_pty {
+                EmbedStatus::Running(_, _) => {
+                    let mut guard = embed_pty.lock().unwrap();
+                    copy_area(
+                        grid,
+                        &guard.grid,
+                        body_area,
+                        ((0, 0), pos_dec(guard.terminal_size, (1, 1))),
+                    );
+                    guard.set_terminal_size((width!(body_area), height!(body_area)));
+                    context.dirty_areas.push_back(body_area);
+                    self.dirty = false;
+                    return;
+                }
+                EmbedStatus::Stopped(_, _) => {
+                    write_string_to_grid(
+                        "process has stopped, press 'e' to re-activate",
+                        grid,
+                        Color::Default,
+                        Color::Default,
+                        Attr::Default,
+                        body_area,
+                        false,
+                    );
+                    context.dirty_areas.push_back(body_area);
+                    self.dirty = false;
+                    return;
                 }
             }
         } else {
@@ -766,6 +762,15 @@ impl Component for Composer {
         match *event {
             UIEvent::Resize => {
                 self.set_dirty();
+                if let Some(ref mut embed_pty) = self.embed {
+                    match embed_pty {
+                        EmbedStatus::Running(_, _) => {
+                            let mut guard = embed_pty.lock().unwrap();
+                            guard.grid.clear(Cell::default());
+                        }
+                        _ => {}
+                    }
+                }
             }
             /*
             /* Switch e-mail From: field to the `left` configured account. */
@@ -825,7 +830,7 @@ impl Component for Composer {
                 }
                 return true;
             }
-            UIEvent::ChildStatusExited(ref pid, ref exit_code)
+            UIEvent::ChildStatusExited(ref pid, _)
                 if self.embed.is_some()
                     && *pid
                         == self
@@ -835,6 +840,7 @@ impl Component for Composer {
                             .unwrap() =>
             {
                 self.embed = None;
+                self.set_dirty();
                 self.mode = ViewMode::Edit;
                 context
                     .replies
@@ -855,6 +861,7 @@ impl Component for Composer {
                     }
                     _ => {}
                 }
+                self.set_dirty();
                 context
                     .replies
                     .push_back(UIEvent::ChangeMode(UIMode::Normal));
@@ -874,6 +881,7 @@ impl Component for Composer {
                     }
                     _ => {}
                 }
+                self.set_dirty();
                 context
                     .replies
                     .push_back(UIEvent::ChangeMode(UIMode::Embed));
@@ -884,6 +892,7 @@ impl Component for Composer {
                 context
                     .replies
                     .push_back(UIEvent::ChangeMode(UIMode::Normal));
+                self.dirty = true;
             }
             UIEvent::EmbedInput((ref k, ref b)) => {
                 use std::io::Write;
@@ -965,7 +974,7 @@ impl Component for Composer {
                         }
                     }
                 }
-                self.dirty = true;
+                self.set_dirty();
                 return true;
             }
             UIEvent::Input(Key::Char('e')) if self.mode.is_embed() => {
@@ -973,6 +982,7 @@ impl Component for Composer {
                 context
                     .replies
                     .push_back(UIEvent::ChangeMode(UIMode::Embed));
+                self.set_dirty();
                 return true;
             }
             UIEvent::Input(Key::Char('e')) => {
@@ -1114,14 +1124,19 @@ impl Component for Composer {
     }
 
     fn is_dirty(&self) -> bool {
-        self.dirty
-            || self.pager.is_dirty()
-            || self
-                .reply_context
-                .as_ref()
-                .map(|(_, p)| p.is_dirty())
-                .unwrap_or(false)
-            || self.form.is_dirty()
+        match self.mode {
+            ViewMode::Embed => true,
+            _ => {
+                self.dirty
+                    || self.pager.is_dirty()
+                    || self
+                        .reply_context
+                        .as_ref()
+                        .map(|(_, p)| p.is_dirty())
+                        .unwrap_or(false)
+                    || self.form.is_dirty()
+            }
+        }
     }
 
     fn set_dirty(&mut self) {

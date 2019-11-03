@@ -305,7 +305,8 @@ fn main() -> std::result::Result<(), std::io::Error> {
                                         },
                                     }
                                 },
-                                UIMode::Embed => {},
+                                UIMode::Embed => state.redraw(),
+
                                 UIMode::Fork => {
                                     break 'inner; // `goto` 'reap loop, and wait on child.
                                 },
