@@ -144,6 +144,22 @@ impl From<native_tls::Error> for MeliError {
     }
 }
 
+#[cfg(feature = "jmap_backend")]
+impl From<reqwest::Error> for MeliError {
+    #[inline]
+    fn from(kind: reqwest::Error) -> MeliError {
+        MeliError::new(format!("{}", kind))
+    }
+}
+
+#[cfg(feature = "jmap_backend")]
+impl From<serde_json::error::Error> for MeliError {
+    #[inline]
+    fn from(kind: serde_json::error::Error) -> MeliError {
+        MeliError::new(format!("{}", kind))
+    }
+}
+
 impl From<&str> for MeliError {
     #[inline]
     fn from(kind: &str) -> MeliError {
