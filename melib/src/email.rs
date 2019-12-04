@@ -125,7 +125,7 @@ pub struct Envelope {
     subject: Option<Vec<u8>>,
     message_id: MessageID,
     in_reply_to: Option<MessageID>,
-    references: Option<References>,
+    pub references: Option<References>,
     other_headers: FnvHashMap<String, String>,
 
     timestamp: UnixTimestamp,
@@ -542,6 +542,7 @@ impl Envelope {
             None => Vec::new(),
         }
     }
+
     pub fn other_headers(&self) -> &FnvHashMap<String, String> {
         &self.other_headers
     }
