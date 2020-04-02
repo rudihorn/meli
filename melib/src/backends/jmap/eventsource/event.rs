@@ -1,3 +1,24 @@
+/*
+ * meli - jmap module.
+ *
+ * Copyright 2019 Lukas Werling (lluchs)
+ *
+ * This file is part of meli.
+ *
+ * meli is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * meli is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with meli. If not, see <http://www.gnu.org/licenses/>.
+ */
+
 use std::fmt;
 use std::time::Duration;
 
@@ -48,7 +69,7 @@ pub enum ParseResult {
 /// // ...
 /// ```
 pub fn parse_event_line(line: &str, event: &mut Event) -> ParseResult {
-    let line = line.trim_right_matches(|c| c == '\r' || c == '\n');
+    let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
     if line == "" {
         ParseResult::Dispatch
     } else {
@@ -61,17 +82,24 @@ pub fn parse_event_line(line: &str, event: &mut Event) -> ParseResult {
         } else {
             (line, "")
         };
-        
+
         match field {
-            "event" => { event.event_type = Some(value.to_string()); },
-            "data" => { event.data.push_str(value); event.data.push('\n'); },
-            "id" => { event.id = Some(value.to_string()); }
+            "event" => {
+                event.event_type = Some(value.to_string());
+            }
+            "data" => {
+                event.data.push_str(value);
+                event.data.push('\n');
+            }
+            "id" => {
+                event.id = Some(value.to_string());
+            }
             "retry" => {
                 if let Ok(retry) = value.parse::<u64>() {
                     return ParseResult::SetRetry(Duration::from_millis(retry));
                 }
-            },
-            _ => () // ignored
+            }
+            _ => (), // ignored
         }
 
         ParseResult::Next
@@ -106,13 +134,13 @@ impl Event {
 impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(ref id) = self.id {
-            try!(write!(f, "id: {}\n", id));
+            write!(f, "id: {}\n", id)?;
         }
         if let Some(ref event_type) = self.event_type {
-            try!(write!(f, "event: {}\n", event_type));
+            write!(f, "event: {}\n", event_type)?;
         }
         for line in self.data.lines() {
-            try!(write!(f, "data: {}\n", line));
+            write!(f, "data: {}\n", line)?;
         }
         Ok(())
     }
@@ -126,22 +154,52 @@ mod tests {
     fn basic_event_display() {
         assert_eq!(
             "data: hello world\n",
-            Event { id: None, event_type: None, data: "hello world".to_string() }.to_string());
+            Event {
+                id: None,
+                event_type: None,
+                data: "hello world".to_string()
+            }
+            .to_string()
+        );
         assert_eq!(
             "id: foo\ndata: hello world\n",
-            Event { id: Some("foo".to_string()), event_type: None, data: "hello world".to_string() }.to_string());
+            Event {
+                id: Some("foo".to_string()),
+                event_type: None,
+                data: "hello world".to_string()
+            }
+            .to_string()
+        );
         assert_eq!(
             "event: bar\ndata: hello world\n",
-            Event { id: None, event_type: Some("bar".to_string()), data: "hello world".to_string() }.to_string());
+            Event {
+                id: None,
+                event_type: Some("bar".to_string()),
+                data: "hello world".to_string()
+            }
+            .to_string()
+        );
     }
 
     #[test]
     fn multiline_event_display() {
         assert_eq!(
             "data: hello\ndata: world\n",
-            Event { id: None, event_type: None, data: "hello\nworld".to_string() }.to_string());
+            Event {
+                id: None,
+                event_type: None,
+                data: "hello\nworld".to_string()
+            }
+            .to_string()
+        );
         assert_eq!(
             "data: hello\ndata: \ndata: world\n",
-            Event { id: None, event_type: None, data: "hello\n\nworld".to_string() }.to_string());
+            Event {
+                id: None,
+                event_type: None,
+                data: "hello\n\nworld".to_string()
+            }
+            .to_string()
+        );
     }
 }

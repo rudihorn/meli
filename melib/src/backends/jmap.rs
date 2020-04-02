@@ -74,6 +74,8 @@ use objects::*;
 pub mod mailbox;
 use mailbox::*;
 
+pub mod eventsource;
+
 #[derive(Debug, Default)]
 pub struct EnvelopeCache {
     bytes: Option<String>,

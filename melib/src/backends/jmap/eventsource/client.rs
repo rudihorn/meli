@@ -1,47 +1,65 @@
+/*
+ * meli - jmap module.
+ *
+ * Copyright 2019 Lukas Werling (lluchs)
+ *
+ * This file is part of meli.
+ *
+ * meli is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * meli is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with meli. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+// Original code by Lukas Werling (lluchs)
 //! # Reqwest-based EventSource client
 
-extern crate mime;
-extern crate reqwest as reqw;
-
-mod errors {
-    error_chain! {
-        foreign_links {
-            Reqwest(super::reqw::Error);
-            Io(::std::io::Error);
-        }
-
-        errors {
-            Http(status: super::reqw::StatusCode) {
-                description("HTTP request failed")
-                display("HTTP status code: {}", status)
-            }
-            InvalidContentType(mime_type: mime::Mime) {
-                description("unexpected Content-Type header")
-                display("unexpected Content-Type: {}", mime_type)
-            }
-            NoContentType {
-                description("no Content-Type header in response")
-                display("Content-Type missing")
-            }
-        }
-    }
-}
-pub use self::errors::*;
-
-use self::reqw::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
 use super::event::{parse_event_line, Event, ParseResult};
+use crate::error::*;
+use reqwest;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
 const DEFAULT_RETRY: u64 = 5000;
 
+impl MeliError {
+    fn http_error(status_code: reqwest::StatusCode) -> MeliError {
+        MeliError {
+            summary: Some("HTTP request failed".into()),
+            details: format!("HTTP status code: {}", status_code).into(),
+        }
+    }
+
+    fn invalid_content_type(mime_type: &str) -> MeliError {
+        MeliError {
+            summary: Some("unexpected Content-Type header".into()),
+            details: format!("unexpected Content-Type: {}", mime_type).into(),
+        }
+    }
+    fn no_content_type() -> MeliError {
+        MeliError {
+            summary: Some("no Content-Type header in response".into()),
+            details: "Content-Type missing".into(),
+        }
+    }
+}
+
 /// A client for a Server-Sent Events endpoint.
 ///
 /// Read events by iterating over the client.
 pub struct Client {
-    client: reqw::Client,
-    response: Option<BufReader<reqw::Response>>,
-    url: reqw::Url,
+    client: reqwest::blocking::Client,
+    response: Option<BufReader<reqwest::blocking::Response>>,
+    url: reqwest::Url,
     last_event_id: Option<String>,
     last_try: Option<Instant>,
 
@@ -54,9 +72,9 @@ impl Client {
     /// Constructs a new EventSource client for the given URL.
     ///
     /// This does not start an HTTP request.
-    pub fn new(url: reqw::Url) -> Client {
+    pub fn new(url: reqwest::Url) -> Client {
         Client {
-            client: reqw::Client::new(),
+            client: reqwest::blocking::Client::new(),
             response: None,
             url: url,
             last_event_id: None,
@@ -78,24 +96,17 @@ impl Client {
         {
             let status = res.status();
             if !status.is_success() {
-                return Err(ErrorKind::Http(status.clone()).into());
+                return Err(MeliError::http_error(status));
             }
 
             if let Some(content_type_hv) = res.headers().get(CONTENT_TYPE) {
-                let content_type = content_type_hv
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-                    .parse::<mime::Mime>()
-                    .unwrap();
+                let content_type = content_type_hv.to_str().unwrap().to_string();
                 // Compare type and subtype only, MIME parameters are ignored.
-                if (content_type.type_(), content_type.subtype())
-                    != (mime::TEXT, mime::EVENT_STREAM)
-                {
-                    return Err(ErrorKind::InvalidContentType(content_type.clone()).into());
+                if content_type != "text/event-stream" {
+                    return Err(MeliError::invalid_content_type(&content_type));
                 }
             } else {
-                return Err(ErrorKind::NoContentType.into());
+                return Err(MeliError::no_content_type());
             }
         }
 
