@@ -28,6 +28,7 @@ use crate::email::*;
 use crate::error::{MeliError, Result};
 use fnv::FnvHashMap;
 use reqwest::blocking::Client;
+use reqwest::Url;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -75,6 +76,7 @@ pub mod mailbox;
 use mailbox::*;
 
 pub mod eventsource;
+use eventsource::client::EventSourceClient;
 
 #[derive(Debug, Default)]
 pub struct EnvelopeCache {
@@ -236,9 +238,39 @@ impl MailBackend for JmapType {
     fn watch(
         &self,
         _sender: RefreshEventConsumer,
-        _work_context: WorkContext,
+        work_context: WorkContext,
     ) -> Result<std::thread::ThreadId> {
-        Err(MeliError::from("JMAP watch for updates is unimplemented"))
+        let connection = JmapConnection::new(&self.server_conf, self.online.clone())?;
+
+        let handle = std::thread::Builder::new()
+            .name(format!("{} jmap connection", self.account_name.as_str(),))
+            .spawn(move || {
+                let thread = std::thread::current();
+                work_context
+                    .set_status
+                    .send((thread.id(), "watching".to_string()))
+                    .unwrap();
+
+                let event_source_url = connection.session.event_source_url.clone();
+                debug!(&event_source_url);
+                let client = EventSourceClient::new(
+                    Url::parse(&event_source_url).unwrap(),
+                    vec![
+                        (
+                            "types".to_string(),
+                            "Email,EmailDelivery,Mailbox".to_string(),
+                        ),
+                        ("closeafter".to_string(), "no".to_string()),
+                        ("ping".to_string(), "1".to_string()),
+                    ],
+                    connection,
+                );
+                for event in client {
+                    debug!(&event);
+                    println!("{}", event.unwrap());
+                }
+            })?;
+        Ok(handle.thread().id())
     }
 
     fn mailboxes(&self) -> Result<FnvHashMap<MailboxHash, Mailbox>> {

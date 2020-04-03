@@ -23,6 +23,7 @@
 //! # Reqwest-based EventSource client
 
 use super::event::{parse_event_line, Event, ParseResult};
+use crate::backends::jmap::JmapConnection;
 use crate::error::*;
 use reqwest;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
@@ -56,10 +57,11 @@ impl MeliError {
 /// A client for a Server-Sent Events endpoint.
 ///
 /// Read events by iterating over the client.
-pub struct Client {
-    client: reqwest::blocking::Client,
+pub struct EventSourceClient {
+    connection: JmapConnection,
     response: Option<BufReader<reqwest::blocking::Response>>,
     url: reqwest::Url,
+    query: Vec<(String, String)>,
     last_event_id: Option<String>,
     last_try: Option<Instant>,
 
@@ -68,15 +70,23 @@ pub struct Client {
     pub retry: Duration,
 }
 
-impl Client {
+impl EventSourceClient {
     /// Constructs a new EventSource client for the given URL.
     ///
     /// This does not start an HTTP request.
-    pub fn new(url: reqwest::Url) -> Client {
-        Client {
-            client: reqwest::blocking::Client::new(),
+    pub fn new(
+        url: reqwest::Url,
+        query: Vec<(String, String)>,
+        connection: JmapConnection,
+    ) -> EventSourceClient {
+        debug!("&url = {:#?}", &url);
+        debug!("&connection.session = {:#?}", &connection.session);
+        debug!("&connection.server_conf = {:#?}", &connection.server_conf);
+        EventSourceClient {
+            connection,
             response: None,
-            url: url,
+            url,
+            query,
             last_event_id: None,
             last_try: None,
             retry: Duration::from_millis(DEFAULT_RETRY),
@@ -90,7 +100,20 @@ impl Client {
             headers.insert("Last-Event-ID", HeaderValue::from_str(id).unwrap());
         }
 
-        let res = self.client.get(self.url.clone()).headers(headers).send()?;
+        let res = debug!(self
+            .connection
+            .client
+            .lock()
+            .unwrap()
+            .get(self.url.clone())
+            .basic_auth(
+                &self.connection.server_conf.server_username,
+                Some(&self.connection.server_conf.server_password),
+            )
+            .query(&self.query)
+            .headers(headers))
+        .send()?;
+        debug!(&res);
 
         // Check status code and Content-Type.
         {
@@ -128,7 +151,7 @@ macro_rules! try_option {
 /// Iterate over the client to get events.
 ///
 /// HTTP requests are made transparently while iterating.
-impl Iterator for Client {
+impl Iterator for EventSourceClient {
     type Item = Result<Event>;
 
     fn next(&mut self) -> Option<Result<Event>> {
