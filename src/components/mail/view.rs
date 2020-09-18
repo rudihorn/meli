@@ -541,10 +541,11 @@ impl MailView {
                             name_opt = name.as_ref().map(|n| n.clone());
                         }
                         if let Ok(binary) = binary {
-                            let p = create_temp_file(
+                            let p = MeliFile::create_temp_file(
                                 &decode(u, None),
                                 name_opt.as_ref().map(String::as_str),
                                 None,
+                                true,
                                 true,
                             );
                             match debug!(context.plugin_manager.activate_hook(

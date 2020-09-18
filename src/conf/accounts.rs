@@ -1133,7 +1133,7 @@ impl Account {
         if let Some(mailbox_hash) = saved_at {
             Ok(mailbox_hash)
         } else {
-            let file = crate::types::create_temp_file(bytes, None, None, false);
+            let file = crate::types::MeliFile::create_temp_file(bytes, None, None, false, false);
             debug!("message saved in {}", file.path.display());
             melib::log(
                 format!(
@@ -1684,7 +1684,9 @@ impl Account {
                     let r = channel.try_recv().unwrap();
                     if let Some(Err(err)) = r {
                         melib::log(format!("Could not save message: {}", err), melib::ERROR);
-                        let file = crate::types::create_temp_file(bytes, None, None, false);
+                        let file = crate::types::MeliFile::create_temp_file(
+                            bytes, None, None, false, false,
+                        );
                         debug!("message saved in {}", file.path.display());
                         melib::log(
                             format!(

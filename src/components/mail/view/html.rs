@@ -133,7 +133,7 @@ impl Component for HtmlView {
         if let UIEvent::Input(Key::Char('v')) = event {
             let binary = query_default_app("text/html");
             if let Ok(binary) = binary {
-                let p = create_temp_file(&self.bytes, None, None, true);
+                let p = MeliFile::create_temp_file(&self.bytes, None, None, true, true);
                 match Command::new(&binary)
                     .arg(p.path())
                     .stdin(Stdio::piped())

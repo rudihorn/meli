@@ -26,8 +26,8 @@ use std::process::{Command, Stdio};
 pub fn verify_signature(a: &Attachment, context: &mut Context) -> Vec<u8> {
     match melib::signatures::verify_signature(a) {
         Ok((bytes, sig)) => {
-            let bytes_file = create_temp_file(&bytes, None, None, true);
-            let signature_file = create_temp_file(sig, None, None, true);
+            let bytes_file = MeliFile::create_temp_file(&bytes, None, None, true, true);
+            let signature_file = MeliFile::create_temp_file(sig, None, None, true, true);
             match Command::new(
                 context
                     .settings

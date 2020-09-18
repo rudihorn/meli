@@ -439,10 +439,11 @@ impl Component for EnvelopeView {
                                 let attachment_type = u.mime_type();
                                 let binary = query_default_app(&attachment_type);
                                 if let Ok(binary) = binary {
-                                    let p = create_temp_file(
+                                    let p = MeliFile::create_temp_file(
                                         &decode(u, None),
                                         name.as_ref().map(String::as_str),
                                         None,
+                                        true,
                                         true,
                                     );
                                     match Command::new(&binary)

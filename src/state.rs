@@ -117,7 +117,7 @@ pub struct Context {
     pub children: Vec<std::process::Child>,
     pub plugin_manager: PluginManager,
 
-    pub temp_files: Vec<File>,
+    pub temp_files: Vec<MeliFile>,
 }
 
 impl Context {

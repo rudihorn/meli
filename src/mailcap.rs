@@ -22,7 +22,7 @@
 /*! Find mailcap entries to execute attachments.
  */
 use crate::state::Context;
-use crate::types::{create_temp_file, ForkType, UIEvent};
+use crate::types::{ForkType, MeliFile, UIEvent};
 use melib::attachments::decode;
 use melib::text_processing::GlobMatch;
 use melib::{email::Attachment, MeliError, Result};
@@ -157,7 +157,13 @@ impl MailcapEntry {
                     .map(|arg| match *arg {
                         "%s" => {
                             needs_stdin = false;
-                            let _f = create_temp_file(&decode(a, None), None, None, true);
+                            let _f = MeliFile::create_temp_file(
+                                &decode(a, None),
+                                None,
+                                None,
+                                true,
+                                true,
+                            );
                             let p = _f.path().display().to_string();
                             f = Some(_f);
                             p

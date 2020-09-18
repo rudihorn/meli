@@ -32,8 +32,8 @@
  */
 extern crate serde;
 #[macro_use]
-mod helpers;
-pub use self::helpers::*;
+mod files;
+pub use self::files::*;
 
 use super::command::Action;
 use super::jobs::JobId;
@@ -86,7 +86,7 @@ pub enum ForkType {
     /// Embed pty
     Embed(Pid),
     Generic(std::process::Child),
-    NewDraft(File, std::process::Child),
+    NewDraft(MeliFile, std::process::Child),
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]

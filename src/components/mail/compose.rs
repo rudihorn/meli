@@ -42,8 +42,8 @@ enum Cursor {
 
 #[derive(Debug)]
 enum EmbedStatus {
-    Stopped(Arc<Mutex<EmbedGrid>>, File),
-    Running(Arc<Mutex<EmbedGrid>>, File),
+    Stopped(Arc<Mutex<EmbedGrid>>, MeliFile),
+    Running(Arc<Mutex<EmbedGrid>>, MeliFile),
 }
 
 impl std::ops::Deref for EmbedStatus {
@@ -1132,10 +1132,11 @@ impl Component for Composer {
                 };
                 /* update Draft's headers based on form values */
                 self.update_draft();
-                let f = create_temp_file(
+                let f = MeliFile::create_temp_file(
                     self.draft.to_string().unwrap().as_str().as_bytes(),
                     None,
                     None,
+                    false,
                     true,
                 );
 
@@ -1230,11 +1231,11 @@ impl Component for Composer {
                         ));
                         return false;
                     }
-                    let f = create_temp_file(&[], None, None, true);
+                    let f = MeliFile::create_temp_file(&[], None, None, false, true);
                     match std::process::Command::new("sh")
                         .args(&["-c", command])
                         .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::from(f.file()))
+                        .stdout(std::process::Stdio::from(f.get_file()))
                         .spawn()
                     {
                         Ok(child) => {
